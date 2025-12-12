@@ -10,21 +10,21 @@ import io.github.thebusybiscuit.slimefun4.api.recipes.RecipeType;
 import io.github.thebusybiscuit.slimefun4.core.handlers.BlockBreakHandler;
 import io.github.thebusybiscuit.slimefun4.implementation.Slimefun;
 import io.github.thebusybiscuit.slimefun4.implementation.SlimefunItems;
-import io.github.thebusybiscuit.slimefun4.libraries.dough.inventory.InvUtils;
 import io.github.thebusybiscuit.slimefun4.libraries.dough.items.CustomItemStack;
-import io.github.thebusybiscuit.slimefun4.libraries.dough.items.ItemUtils;
 import io.github.thebusybiscuit.slimefun4.utils.ChestMenuUtils;
-import io.github.thebusybiscuit.slimefun4.utils.itemstack.ItemStackWrapper;
 import io.ncbpfluffybear.fluffymachines.objects.DoubleHologramOwner;
 import io.ncbpfluffybear.fluffymachines.objects.NonHopperableBlock;
 import io.ncbpfluffybear.fluffymachines.utils.Utils;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
+import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
-
 import me.mrCookieSlime.CSCoreLibPlugin.Configuration.Config;
 import me.mrCookieSlime.CSCoreLibPlugin.general.Inventory.ClickAction;
 import me.mrCookieSlime.Slimefun.Objects.handlers.BlockTicker;
@@ -36,6 +36,7 @@ import me.mrCookieSlime.Slimefun.api.item_transport.ItemTransportFlow;
 import org.apache.commons.lang.WordUtils;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
@@ -43,7 +44,11 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.util.Vector;
+import org.bukkit.util.io.BukkitObjectInputStream;
+import org.bukkit.util.io.BukkitObjectOutputStream;
 
 /**
  * A Remake of Barrels by John000708
@@ -69,11 +74,11 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
     public static final DecimalFormat STORAGE_INDICATOR_FORMAT = new DecimalFormat("###,###.####",
             DecimalFormatSymbols.getInstance(Locale.ROOT));
 
-    private final ItemStack HOLOGRAM_OFF_ITEM = new CustomItemStack(Material.QUARTZ_SLAB, "&3Toggle Hologram &c(Off)");
-    private final ItemStack HOLOGRAM_ON_ITEM = new CustomItemStack(Material.QUARTZ_SLAB, "&3Toggle Hologram &a(On)");
-    private final ItemStack TRASH_ON_ITEM = new CustomItemStack(SlimefunItems.TRASH_CAN, "&3Toggle Overfill Trash &a(On)",
+    private final ItemStack HOLOGRAM_OFF_ITEM = CustomItemStack.create(Material.QUARTZ_SLAB, "&3Toggle Hologram &c(Off)");
+    private final ItemStack HOLOGRAM_ON_ITEM = CustomItemStack.create(Material.QUARTZ_SLAB, "&3Toggle Hologram &a(On)");
+    private final ItemStack TRASH_ON_ITEM = CustomItemStack.create(SlimefunItems.TRASH_CAN.item(), "&3Toggle Overfill Trash &a(On)",
             "&7Turn on to delete unstorable items");
-    private final ItemStack TRASH_OFF_ITEM = new CustomItemStack(SlimefunItems.TRASH_CAN, "&3Toggle Overfill Trash &c(Off)",
+    private final ItemStack TRASH_OFF_ITEM = CustomItemStack.create(SlimefunItems.TRASH_CAN.item(), "&3Toggle Overfill Trash &c(Off)",
             "&7Turn on to delete unstorable items"
     );
 
@@ -81,6 +86,91 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
     private final ItemSetting<Boolean> breakOnlyWhenEmpty = new ItemSetting<>(this, "break-only-when-empty", false);
 
     protected final ItemSetting<Integer> barrelCapacity;
+
+    // BlockStorage keys for strict NBT matching
+    private static final String STORED_ITEM_B64_KEY = "stored_item_b64";
+    private static final String STORED_AMOUNT_KEY = "stored_amount";
+
+    // InfinityExpansion 2 storage tag key - items with this tag must be rejected
+    // Note: Using deprecated constructor as it's the most reliable way for external plugin keys
+    @SuppressWarnings("deprecation")
+    private static final NamespacedKey INFINITY_EXPANSION_STORAGE_KEY = new NamespacedKey("infinityexpansion2", "storage");
+
+    /**
+     * Serializes an ItemStack to a Base64 string
+     *
+     * @param item The ItemStack to serialize
+     * @return Base64 string representation of the ItemStack, or null if serialization fails
+     */
+    @Nullable
+    private String serializeItemStackToBase64(@Nonnull ItemStack item) {
+        try {
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            BukkitObjectOutputStream dataOutput = new BukkitObjectOutputStream(outputStream);
+            dataOutput.writeObject(item);
+            dataOutput.close();
+            return Base64.getEncoder().encodeToString(outputStream.toByteArray());
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Deserializes an ItemStack from a Base64 string
+     *
+     * @param base64 The Base64 string to deserialize
+     * @return The deserialized ItemStack, or null if deserialization fails
+     */
+    @Nullable
+    private ItemStack deserializeItemStackFromBase64(@Nonnull String base64) {
+        try {
+            byte[] data = Base64.getDecoder().decode(base64);
+            ByteArrayInputStream inputStream = new ByteArrayInputStream(data);
+            BukkitObjectInputStream dataInput = new BukkitObjectInputStream(inputStream);
+            ItemStack item = (ItemStack) dataInput.readObject();
+            dataInput.close();
+            return item;
+        } catch (IOException | ClassNotFoundException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Strictly compares two ItemStacks including all NBT data
+     * This method serializes both items to Base64 and compares the strings
+     * to ensure 100% NBT matching. This prevents item duplication/transmutation exploits.
+     *
+     * @param item1 First item to compare (input item)
+     * @param item2 Second item to compare (stored prototype)
+     * @return true if items are identical including all NBT data, false otherwise
+     */
+    private boolean strictNBTMatch(@Nonnull ItemStack item1, @Nonnull ItemStack item2) {
+        // First check basic properties - type must match
+        if (item1.getType() != item2.getType()) {
+            return false;
+        }
+
+        // Create clones with amount = 1 for fair comparison (amount doesn't affect NBT)
+        ItemStack clone1 = item1.clone();
+        clone1.setAmount(1);
+        ItemStack clone2 = item2.clone();
+        clone2.setAmount(1);
+
+        // Serialize both to Base64 - this captures ALL NBT data including custom tags
+        String base64_1 = serializeItemStackToBase64(clone1);
+        String base64_2 = serializeItemStackToBase64(clone2);
+
+        // If serialization fails for either item, reject the match (fail-safe)
+        // This prevents exploits if serialization is somehow bypassed
+        if (base64_1 == null || base64_2 == null) {
+            return false; // Reject on serialization failure - be strict
+        }
+
+        // Compare Base64 strings byte-by-byte
+        // If they match exactly, items are 100% identical including all NBT data
+        // If they don't match, items have different NBT and should NOT stack
+        return base64_1.equals(base64_2);
+    }
 
     public Barrel(ItemGroup category, SlimefunItemStack item, RecipeType recipeType, ItemStack[] recipe,
                   int MAX_STORAGE) {
@@ -170,14 +260,15 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
                     inv.dropItems(b.getLocation(), OUTPUT_SLOTS);
 
                     if (stored > 0) {
-                        int stackSize = inv.getItemInSlot(DISPLAY_SLOT).getMaxStackSize();
-                        ItemStack unKeyed = getStoredItem(b);
+                        ItemStack storedItem = getStoredItem(b);
 
-                        if (unKeyed.getType() == Material.BARRIER) {
+                        if (storedItem.getType() == Material.BARRIER) {
                             setStored(b, 0);
                             updateMenu(b, inv, true, capacity);
                             return;
                         }
+
+                        int stackSize = storedItem.getMaxStackSize();
 
                         if (stored > OVERFLOW_AMOUNT) {
 
@@ -185,14 +276,18 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
                                     "Dropping " + OVERFLOW_AMOUNT + " items instead!");
                             int toRemove = OVERFLOW_AMOUNT;
                             while (toRemove >= stackSize) {
-
-                                b.getWorld().dropItemNaturally(b.getLocation(), new CustomItemStack(unKeyed, stackSize));
-
+                                // Create a fresh clone to ensure NBT is properly copied
+                                ItemStack clone = storedItem.clone();
+                                clone.setAmount(stackSize);
+                                b.getWorld().dropItemNaturally(b.getLocation(), clone);
                                 toRemove = toRemove - stackSize;
                             }
 
                             if (toRemove > 0) {
-                                b.getWorld().dropItemNaturally(b.getLocation(), new CustomItemStack(unKeyed, toRemove));
+                                // Create a fresh clone to ensure NBT is properly copied
+                                ItemStack clone = storedItem.clone();
+                                clone.setAmount(toRemove);
+                                b.getWorld().dropItemNaturally(b.getLocation(), clone);
                             }
 
                             setStored(b, stored - OVERFLOW_AMOUNT);
@@ -203,15 +298,19 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
 
                             // Everything greater than 1 stack
                             while (stored >= stackSize) {
-
-                                b.getWorld().dropItemNaturally(b.getLocation(), new CustomItemStack(unKeyed, stackSize));
-
+                                // Create a fresh clone to ensure NBT is properly copied
+                                ItemStack clone = storedItem.clone();
+                                clone.setAmount(stackSize);
+                                b.getWorld().dropItemNaturally(b.getLocation(), clone);
                                 stored = stored - stackSize;
                             }
 
                             // Drop remaining, if there is any
                             if (stored > 0) {
-                                b.getWorld().dropItemNaturally(b.getLocation(), new CustomItemStack(unKeyed, stored));
+                                // Create a fresh clone to ensure NBT is properly copied
+                                ItemStack clone = storedItem.clone();
+                                clone.setAmount(stored);
+                                b.getWorld().dropItemNaturally(b.getLocation(), clone);
                             }
 
                             // In case they use an explosive pick
@@ -237,12 +336,15 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
     protected void buildMenu(BlockMenu menu, Block b) {
         int capacity = getCapacity(b);
 
-        // Initialize an empty barrel
-        if (BlockStorage.getLocationInfo(b.getLocation(), "stored") == null) {
+        // Initialize an empty barrel (check both old and new keys for backward compatibility)
+        String storedAmount = BlockStorage.getLocationInfo(b.getLocation(), STORED_AMOUNT_KEY);
+        String oldStored = BlockStorage.getLocationInfo(b.getLocation(), "stored");
+        
+        if (storedAmount == null && oldStored == null) {
 
-            menu.replaceExistingItem(STATUS_SLOT, new CustomItemStack(
+            menu.replaceExistingItem(STATUS_SLOT, CustomItemStack.create(
                     Material.LIME_STAINED_GLASS_PANE, "&6Items Stored: &e0" + " / " + capacity, "&70%"));
-            menu.replaceExistingItem(DISPLAY_SLOT, new CustomItemStack(Material.BARRIER, "&cEmpty"));
+            menu.replaceExistingItem(DISPLAY_SLOT, CustomItemStack.create(Material.BARRIER, "&cEmpty"));
 
             setStored(b, 0);
 
@@ -286,7 +388,7 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
         // Insert all
         int INSERT_ALL_SLOT = 43;
         menu.replaceExistingItem(INSERT_ALL_SLOT,
-                new CustomItemStack(Material.LIME_STAINED_GLASS_PANE, "&bInsert All",
+                CustomItemStack.create(Material.LIME_STAINED_GLASS_PANE, "&bInsert All",
                         "&7> Click here to insert all", "&7compatible items into the barrel"));
         menu.addMenuClickHandler(INSERT_ALL_SLOT, (pl, slot, item, action) -> {
             insertAll(pl, menu, b);
@@ -296,7 +398,7 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
         // Extract all
         int EXTRACT_SLOT = 44;
         menu.replaceExistingItem(EXTRACT_SLOT,
-                new CustomItemStack(Material.RED_STAINED_GLASS_PANE, "&6Extract All",
+                CustomItemStack.create(Material.RED_STAINED_GLASS_PANE, "&6Extract All",
                         "&7> Left click to extract", "&7all items to your inventory",
                         "&7> Right click to extract 1 item"
                 ));
@@ -336,157 +438,151 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
     }
 
     void acceptInput(BlockMenu inv, Block b, int slot, int capacity) {
-        if (inv.getItemInSlot(slot) == null) {
+        ItemStack item = inv.getItemInSlot(slot);
+        if (item == null) {
             return;
         }
 
+        // IMMEDIATE REJECTION: Block InfinityExpansion 2 storage items to prevent conflicts/exploits
+        // This check must be the FIRST logic step - before any other processing
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            PersistentDataContainer pdc = meta.getPersistentDataContainer();
+            // Check if the PDC contains the InfinityExpansion storage key
+            // We check all keys to see if our target key exists
+            for (NamespacedKey key : pdc.getKeys()) {
+                if (key.equals(INFINITY_EXPANSION_STORAGE_KEY)) {
+                    // Item contains infinityexpansion2:storage tag - REJECT immediately
+                    // Do not consume the item, do not modify barrel storage
+                    return;
+                }
+            }
+        }
+
         int stored = getStored(b);
-        ItemStack item = inv.getItemInSlot(slot);
 
         if (stored == 0) {
+            // Barrel is empty: first item becomes the prototype
+            // This item's full NBT (including all custom tags) will be stored as the prototype
             registerItem(b, inv, slot, item, capacity, stored);
-        } else if (stored > 0 && inv.getItemInSlot(DISPLAY_SLOT) != null
-                && matchMeta(Utils.unKeyItem(inv.getItemInSlot(DISPLAY_SLOT)), item)) {
+            return;
+        }
 
-            if (stored < capacity) {
+        // Barrel has items: MUST use strict NBT matching to prevent exploits
+        ItemStack prototype = getStoredItem(b);
+        
+        if (prototype.getType() == Material.BARRIER) {
+            // Prototype is missing/corrupted, treat as empty and register new item
+            registerItem(b, inv, slot, item, capacity, stored);
+            return;
+        }
+        
+        // CRITICAL: Use strict NBT matching - if this returns false, REJECT the item
+        // Items with same display/lore but different NBT must NOT stack
+        if (!strictNBTMatch(item, prototype)) {
+            // NBT doesn't match - REJECT insertion to prevent duplication exploit
+            // Item stays in slot, no modification occurs
+            return;
+        }
 
-                // Can fit entire itemstack
-                if (stored + item.getAmount() <= capacity) {
-                    storeItem(b, inv, slot, item, capacity, stored);
-
-                    // Split itemstack
-                } else {
-                    int amount = capacity - stored;
-                    inv.consumeItem(slot, amount);
-
-                    setStored(b, stored + amount);
-                    updateMenu(b, inv, false, capacity);
-                }
+        // Only reach here if strictNBTMatch returned true
+        // Now we can safely store the item since NBT matches exactly
+        if (stored < capacity) {
+            // Can fit entire itemstack
+            if (stored + item.getAmount() <= capacity) {
+                // Store entire stack
+                storeItem(b, inv, slot, item, capacity, stored);
             } else {
-                String useTrash = BlockStorage.getLocationInfo(b.getLocation(), "trash");
-
-                if (useTrash != null && useTrash.equals("true")) {
-                    inv.replaceExistingItem(slot, null);
-                }
-
+                // Partial insertion - only store what fits
+                int amount = capacity - stored;
+                inv.consumeItem(slot, amount);
+                setStored(b, stored + amount);
+                updateMenu(b, inv, false, capacity);
             }
-        }
-    }
-
-    // DirtyChestMenu#fits() does not check for nbt data...
-    public boolean fits(DirtyChestMenu inv, @Nonnull ItemStack item, int... slots) {
-        int metaMismatches = 0;
-        for (int slot : slots) {
-            ItemStack slotItem = inv.getItemInSlot(slot);
-            // A small optimization for empty slots
-            if (inv.getItemInSlot(slot) == null) {
-                return true;
-            }
-
-            // Heavy but foolproof check
-            if (!matchMeta(item, slotItem)) {
-                metaMismatches++;
-            }
-        }
-
-        if (metaMismatches == slots.length) {
-            return false;
-        }
-
-        // This still performs other config based checks to see if insertion is valid...
-        return InvUtils.fits(inv.toInventory(), ItemStackWrapper.wrap(item), slots);
-    }
-
-    // DirtyChestMenu#pushItem() does not check for nbt data...
-    @Nullable
-    public ItemStack pushItem(DirtyChestMenu inv, ItemStack item, int... slots) {
-        if (item == null || item.getType() == Material.AIR) {
-            throw new IllegalArgumentException("Cannot push null or AIR");
-        }
-
-        ItemStackWrapper wrapper = null;
-        int amount = item.getAmount();
-
-        for (int slot : slots) {
-            if (amount <= 0) {
-                break;
-            }
-
-            ItemStack stack = inv.getItemInSlot(slot);
-
-            if (stack == null) {
-                inv.replaceExistingItem(slot, item);
-                return null;
-            } else {
-                int maxStackSize = Math.min(stack.getMaxStackSize(), inv.toInventory().getMaxStackSize());
-                if (stack.getAmount() < maxStackSize) {
-                    if (wrapper == null) {
-                        wrapper = ItemStackWrapper.wrap(item);
-                    }
-
-                    // Patched with a meta check
-                    if (ItemUtils.canStack(wrapper, stack) && matchMeta(wrapper, stack)) {
-                        amount -= (maxStackSize - stack.getAmount());
-                        stack.setAmount(Math.min(stack.getAmount() + item.getAmount(), maxStackSize));
-                        item.setAmount(amount);
-                    }
-                }
-            }
-        }
-
-        if (amount > 0) {
-            return new CustomItemStack(item, amount);
         } else {
-            return null;
+            // Barrel is full
+            String useTrash = BlockStorage.getLocationInfo(b.getLocation(), "trash");
+            if (useTrash != null && useTrash.equals("true")) {
+                inv.replaceExistingItem(slot, null);
+            }
+            // If trash is off, item stays in slot
         }
     }
 
     void pushOutput(BlockMenu inv, Block b, int capacity) {
-        ItemStack displayItem = inv.getItemInSlot(DISPLAY_SLOT);
-        if (displayItem != null && displayItem.getType() != Material.BARRIER) {
+        ItemStack storedItem = getStoredItem(b);
+        if (storedItem.getType() == Material.BARRIER) {
+            return;
+        }
 
-            int stored = getStored(b);
+        int stored = getStored(b);
+        if (stored == 0) {
+            return;
+        }
 
-            // Output stack
-            if (stored > displayItem.getMaxStackSize()) {
+        // Output stack
+        if (stored > storedItem.getMaxStackSize()) {
+            // Create a fresh clone to ensure NBT is properly copied
+            ItemStack clone = storedItem.clone();
+            clone.setAmount(storedItem.getMaxStackSize());
 
-                ItemStack clone = new CustomItemStack(Utils.unKeyItem(displayItem), displayItem.getMaxStackSize());
+            if (inv.fits(clone, OUTPUT_SLOTS)) {
+                int amount = clone.getMaxStackSize();
+                setStored(b, stored - amount);
+                inv.pushItem(clone, OUTPUT_SLOTS);
+                updateMenu(b, inv, false, capacity);
+            }
+        } else {
+            // Output remaining - create a fresh clone to ensure NBT is properly copied
+            ItemStack clone = storedItem.clone();
+            clone.setAmount(stored);
 
-
-                if (fits(inv, clone, OUTPUT_SLOTS)) {
-                    int amount = clone.getMaxStackSize();
-
-                    setStored(b, stored - amount);
-                    pushItem(inv, clone, OUTPUT_SLOTS);
-                    updateMenu(b, inv, false, capacity);
-                }
-
-            } else if (stored != 0) {   // Output remaining
-
-                ItemStack clone = new CustomItemStack(Utils.unKeyItem(displayItem), stored);
-
-                if (fits(inv, clone, OUTPUT_SLOTS)) {
-                    setStored(b, 0);
-                    pushItem(inv, clone, OUTPUT_SLOTS);
-                    updateMenu(b, inv, false, capacity);
-                }
+            if (inv.fits(clone, OUTPUT_SLOTS)) {
+                setStored(b, 0);
+                inv.pushItem(clone, OUTPUT_SLOTS);
+                updateMenu(b, inv, false, capacity);
             }
         }
     }
 
     private void registerItem(Block b, BlockMenu inv, int slot, ItemStack item, int capacity, int stored) {
+        if (item == null) {
+            return;
+        }
+
         int amount = item.getAmount();
+        
+        // CRITICAL: Create prototype from the FULL item including ALL NBT data
+        // Clone the item to preserve all NBT, then set amount to 1 for storage
+        ItemStack prototype = item.clone();
+        prototype.setAmount(1);
+        
+        // Serialize the FULL prototype (with all NBT) to Base64
+        // This captures everything: ItemMeta, custom NBT tags, enchantments, etc.
+        String base64 = serializeItemStackToBase64(prototype);
+        
+        if (base64 == null || base64.isEmpty()) {
+            // Serialization failed - don't store to prevent corruption
+            // Item stays in slot
+            return;
+        }
+        
+        // Save the complete prototype (with all NBT) to BlockStorage
+        // This becomes the reference for all future comparisons
+        BlockStorage.addBlockInfo(b.getLocation(), STORED_ITEM_B64_KEY, base64);
+        
+        // Update display slot (visual only - not used for data)
+        inv.replaceExistingItem(DISPLAY_SLOT, CustomItemStack.create(Utils.keyItem(item), 1));
 
-        inv.replaceExistingItem(DISPLAY_SLOT, new CustomItemStack(Utils.keyItem(item), 1));
-
-        // Fit all
+        // Store the item amount
         if (amount <= capacity) {
+            // Can fit entire stack
             storeItem(b, inv, slot, item, capacity, stored);
         } else {
-            amount = capacity;
-            inv.consumeItem(slot, amount);
-
-            setStored(b, stored + amount);
+            // Only fit partial amount
+            int amountToStore = capacity;
+            inv.consumeItem(slot, amountToStore);
+            setStored(b, stored + amountToStore);
             updateMenu(b, inv, false, capacity);
         }
     }
@@ -499,25 +595,6 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
         updateMenu(b, inv, false, capacity);
     }
 
-    /**
-     * This method checks if two items have the same metadata
-     *
-     * @param item1 is the first item to compare
-     * @param item2 is the second item to compare
-     * @return if the items have the same meta
-     */
-    private boolean matchMeta(ItemStack item1, ItemStack item2) {
-        // It seems the meta comparisons are heavier than type checks
-        if (!item1.getType().equals(item2.getType())) {
-            return false;
-        }
-
-        if (!item1.hasItemMeta() || !item2.hasItemMeta()) {
-            return true; // Match by type
-        }
-
-        return item1.getItemMeta().equals(item2.getItemMeta());
-    }
 
     /**
      * This method updates the barrel's menu and hologram displays
@@ -528,33 +605,42 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
     public void updateMenu(Block b, BlockMenu inv, boolean force, int capacity) {
         String hasHolo = BlockStorage.getLocationInfo(b.getLocation(), "holo");
         int stored = getStored(b);
+        ItemStack storedItem = getStoredItem(b);
         String itemName;
 
         String storedPercent = doubleRoundAndFade((double) stored / (double) capacity * 100);
-        String storedStacks =
-                doubleRoundAndFade((double) stored / (double) inv.getItemInSlot(DISPLAY_SLOT).getMaxStackSize());
+        
+        // Calculate stacks based on stored item's max stack size
+        int maxStackSize = storedItem.getType() != Material.BARRIER ? storedItem.getMaxStackSize() : 64;
+        String storedStacks = doubleRoundAndFade((double) stored / (double) maxStackSize);
 
         // This helps a bit with lag, but may have visual impacts
         if (inv.hasViewer() || force) {
-            inv.replaceExistingItem(STATUS_SLOT, new CustomItemStack(
+            inv.replaceExistingItem(STATUS_SLOT, CustomItemStack.create(
                     Material.LIME_STAINED_GLASS_PANE, "&6Items Stored: &e" + stored + " / " + capacity,
                     "&b" + storedStacks + " Stacks &8| &7" + storedPercent + "&7%"));
         }
 
-        if (inv.getItemInSlot(DISPLAY_SLOT) != null && inv.getItemInSlot(DISPLAY_SLOT).getItemMeta().hasDisplayName()) {
-            itemName = inv.getItemInSlot(DISPLAY_SLOT).getItemMeta().getDisplayName();
-        } else {
-            itemName = WordUtils.capitalizeFully(inv.getItemInSlot(DISPLAY_SLOT).getType().name().replace("_", " "));
-        }
-
-        if (showHologram.getValue() && (hasHolo == null || hasHolo.equals("true"))) {
-            updateHologram(b, itemName, " &9x" + stored + " &7(" + storedPercent + "&7%)");
-        }
-
         if (stored == 0) {
-            inv.replaceExistingItem(DISPLAY_SLOT, new CustomItemStack(Material.BARRIER, "&cEmpty"));
+            // Barrel is empty: update display to barrier
+            inv.replaceExistingItem(DISPLAY_SLOT, CustomItemStack.create(Material.BARRIER, "&cEmpty"));
             if (showHologram.getValue() && (hasHolo == null || hasHolo.equals("true"))) {
                 updateHologram(b, null, "&cEmpty");
+            }
+        } else {
+            // Barrel has items: update display slot (visual only) from stored prototype
+            ItemStack displayItem = CustomItemStack.create(Utils.keyItem(storedItem), 1);
+            inv.replaceExistingItem(DISPLAY_SLOT, displayItem);
+            
+            // Get item name for hologram
+            if (storedItem.hasItemMeta() && storedItem.getItemMeta().hasDisplayName()) {
+                itemName = storedItem.getItemMeta().getDisplayName();
+            } else {
+                itemName = WordUtils.capitalizeFully(storedItem.getType().name().replace("_", " "));
+            }
+            
+            if (showHologram.getValue() && (hasHolo == null || hasHolo.equals("true"))) {
+                updateHologram(b, itemName, " &9x" + stored + " &7(" + storedPercent + "&7%)");
             }
         }
     }
@@ -596,25 +682,51 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
     }
 
     public void insertAll(Player p, BlockMenu menu, Block b) {
-        ItemStack storedItem = Utils.unKeyItem(menu.getItemInSlot(DISPLAY_SLOT));
+        ItemStack prototype = getStoredItem(b);
         PlayerInventory inv = p.getInventory();
         int capacity = getCapacity(b);
-
         int stored = getStored(b);
 
+        // If barrel is empty, we can't insert all without a prototype
+        if (prototype.getType() == Material.BARRIER) {
+            Utils.send(p, "&cBarrel is empty! Insert an item first to set the prototype.");
+            return;
+        }
+
+        // Iterate through player inventory and only insert items that match prototype exactly
         for (int i = 0; i < inv.getContents().length; i++) {
             ItemStack item = inv.getItem(i);
             if (item == null) {
                 continue;
             }
+            
+            // CRITICAL: Use strict NBT matching - if NBT doesn't match, SKIP this item
+            // Items with same display/lore but different NBT must NOT be inserted
+            if (!strictNBTMatch(item, prototype)) {
+                // NBT doesn't match - skip this item to prevent exploit
+                continue;
+            }
+
+            // Only reach here if strictNBTMatch returned true
+            // Now we can safely insert the item since NBT matches exactly
             int amount = item.getAmount();
-            if (matchMeta(item, storedItem) && stored + amount <= capacity) {
+            if (stored + amount <= capacity) {
+                // Can fit entire stack
                 inv.setItem(i, null);
                 stored += amount;
+            } else {
+                // Partial insertion if over capacity
+                int canFit = capacity - stored;
+                if (canFit > 0) {
+                    item.setAmount(item.getAmount() - canFit);
+                    stored += canFit;
+                }
+                // Barrel is now full, stop processing
+                break;
             }
         }
 
-        BlockStorage.addBlockInfo(b.getLocation(), "stored", String.valueOf(stored));
+        setStored(b, stored);
         updateMenu(b, menu, false, capacity);
     }
 
@@ -628,14 +740,17 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
         // Extract single
         if (action.isRightClicked()) {
             if (stored > 0) { // Extract from stored
-                Utils.giveOrDropItem(p, new CustomItemStack(storedItem));
+                // Create a fresh clone to ensure NBT is properly copied
+                ItemStack clone = storedItem.clone();
+                clone.setAmount(1);
+                Utils.giveOrDropItem(p, clone);
                 setStored(b, --stored);
                 updateMenu(b, menu, false, capacity);
                 return;
             } else {
                 for (int slot : OUTPUT_SLOTS) { // Extract from slot
                     if (menu.getItemInSlot(slot) != null) {
-                        Utils.giveOrDropItem(p, new CustomItemStack(menu.getItemInSlot(slot), 1));
+                        Utils.giveOrDropItem(p, CustomItemStack.create(menu.getItemInSlot(slot), 1));
                         menu.consumeItem(slot);
                         return;
                     }
@@ -659,10 +774,16 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
 
             if (contents[i] == null) {
                 if (stored >= maxStackSize) {
-                    inv.setItem(i, new CustomItemStack(storedItem, maxStackSize));
+                    // Create a fresh clone to ensure NBT is properly copied
+                    ItemStack clone = storedItem.clone();
+                    clone.setAmount(maxStackSize);
+                    inv.setItem(i, clone);
                     stored -= maxStackSize;
                 } else if (stored > 0) {
-                    inv.setItem(i, new CustomItemStack(storedItem, stored));
+                    // Create a fresh clone to ensure NBT is properly copied
+                    ItemStack clone = storedItem.clone();
+                    clone.setAmount(stored);
+                    inv.setItem(i, clone);
                     stored = 0;
                 } else {
                     if (outI > 1) {
@@ -699,15 +820,53 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
     }
 
     public int getStored(Block b) {
-        return Integer.parseInt(BlockStorage.getLocationInfo(b.getLocation(), "stored"));
+        String storedStr = BlockStorage.getLocationInfo(b.getLocation(), STORED_AMOUNT_KEY);
+        // Backward compatibility: check old "stored" key if new key doesn't exist
+        if (storedStr == null) {
+            storedStr = BlockStorage.getLocationInfo(b.getLocation(), "stored");
+            if (storedStr != null) {
+                // Migrate to new key
+                BlockStorage.addBlockInfo(b.getLocation(), STORED_AMOUNT_KEY, storedStr);
+            }
+        }
+        if (storedStr == null) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(storedStr);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     public void setStored(Block b, int amount) {
-        BlockStorage.addBlockInfo(b.getLocation(), "stored", String.valueOf(amount));
+        BlockStorage.addBlockInfo(b.getLocation(), STORED_AMOUNT_KEY, String.valueOf(amount));
+        // Also clear stored item if amount is 0
+        if (amount == 0) {
+            BlockStorage.addBlockInfo(b.getLocation(), STORED_ITEM_B64_KEY, null);
+        }
     }
 
+    /**
+     * Gets the stored item prototype from BlockStorage
+     * Returns a barrier item if no item is stored or deserialization fails
+     */
+    @Nonnull
     public ItemStack getStoredItem(Block b) {
-        return Utils.unKeyItem(BlockStorage.getInventory(b).getItemInSlot(DISPLAY_SLOT));
+        String base64 = BlockStorage.getLocationInfo(b.getLocation(), STORED_ITEM_B64_KEY);
+        if (base64 == null || base64.isEmpty()) {
+            return CustomItemStack.create(Material.BARRIER, "&cEmpty");
+        }
+        
+        ItemStack item = deserializeItemStackFromBase64(base64);
+        if (item == null) {
+            // Deserialization failed, clear the corrupted data
+            BlockStorage.addBlockInfo(b.getLocation(), STORED_ITEM_B64_KEY, null);
+            BlockStorage.addBlockInfo(b.getLocation(), STORED_AMOUNT_KEY, "0");
+            return CustomItemStack.create(Material.BARRIER, "&cEmpty");
+        }
+        
+        return item;
     }
 
     /**
@@ -735,12 +894,12 @@ public class Barrel extends NonHopperableBlock implements DoubleHologramOwner {
 
     public enum BarrelType {
 
-        SMALL(17280000, "&eSmall Fluffy Barrel", Material.BEEHIVE, SlimefunItems.REINFORCED_PLATE, new ItemStack(Material.OAK_LOG)),
-        MEDIUM(34560000, "&6Medium Fluffy Barrel", Material.BARREL, SlimefunItems.REINFORCED_PLATE, new ItemStack(Material.SMOOTH_STONE)),
-        BIG(69120000, "&bBig Fluffy Barrel", Material.SMOKER, SlimefunItems.REINFORCED_PLATE, new ItemStack(Material.BRICKS)),
-        LARGE(138240000, "&aLarge Fluffy Barrel", Material.LODESTONE, SlimefunItems.REINFORCED_PLATE, new ItemStack(Material.IRON_BLOCK)),
-        MASSIVE(276480000, "&5Massive Fluffy Barrel", Material.CRYING_OBSIDIAN, SlimefunItems.REINFORCED_PLATE, new ItemStack(Material.OBSIDIAN)),
-        BOTTOMLESS(1728000000, "&cBottomless Fluffy Barrel", Material.RESPAWN_ANCHOR, SlimefunItems.BLISTERING_INGOT_3, SlimefunItems.REINFORCED_PLATE);
+        SMALL(17280000, "&eSmall Fluffy Barrel", Material.BEEHIVE, SlimefunItems.REINFORCED_PLATE.item(), new ItemStack(Material.OAK_LOG)),
+        MEDIUM(34560000, "&6Medium Fluffy Barrel", Material.BARREL, SlimefunItems.REINFORCED_PLATE.item(), new ItemStack(Material.SMOOTH_STONE)),
+        BIG(69120000, "&bBig Fluffy Barrel", Material.SMOKER, SlimefunItems.REINFORCED_PLATE.item(), new ItemStack(Material.BRICKS)),
+        LARGE(138240000, "&aLarge Fluffy Barrel", Material.LODESTONE, SlimefunItems.REINFORCED_PLATE.item(), new ItemStack(Material.IRON_BLOCK)),
+        MASSIVE(276480000, "&5Massive Fluffy Barrel", Material.CRYING_OBSIDIAN, SlimefunItems.REINFORCED_PLATE.item(), new ItemStack(Material.OBSIDIAN)),
+        BOTTOMLESS(1728000000, "&cBottomless Fluffy Barrel", Material.RESPAWN_ANCHOR, SlimefunItems.BLISTERING_INGOT_3.item(), SlimefunItems.REINFORCED_PLATE.item());
 
         private final int defaultSize;
         private final String displayName;
