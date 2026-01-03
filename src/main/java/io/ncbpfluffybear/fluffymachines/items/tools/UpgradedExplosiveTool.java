@@ -54,32 +54,36 @@ class UpgradedExplosiveTool extends ExplosiveTool {
     @Override
     public ToolUseHandler getItemHandler() {
         return (e, tool, fortune, drops) -> {
-
             if (e instanceof AlternateBreakEvent) {
                 return;
             }
 
             Player p = e.getPlayer();
             Block b = e.getBlock();
+            org.bukkit.World world = b.getWorld();
+            org.bukkit.Location blockLoc = b.getLocation();
 
-            b.getWorld().createExplosion(b.getLocation(), 0.0F);
-            b.getWorld().playSound(b.getLocation(), Sound.ENTITY_GENERIC_EXPLODE, 0.2F, 1F);
+            world.createExplosion(blockLoc, 0.0F);
+            world.playSound(blockLoc, Sound.ENTITY_GENERIC_EXPLODE, 0.2F, 1F);
 
             BlockFace face = p.getFacing();
-            if (p.getLocation().getPitch() > 67.5) {
+            float pitch = p.getLocation().getPitch();
+            if (pitch > 67.5F) {
                 face = BlockFace.DOWN;
-            } else if (p.getLocation().getPitch() < -67.5) {
+            } else if (pitch < -67.5F) {
                 face = BlockFace.UP;
             }
+            
             List<Block> blocks = findBlocks(b, face);
             breakBlocks(p, tool, b, blocks, drops);
         };
     }
 
     private void breakBlocks(Player p, ItemStack item, Block b, List<Block> blocks, List<ItemStack> drops) {
-        List<Block> blocksToDestroy = new ArrayList<>();
+        boolean shouldCallExplosionEvent = callExplosionEvent.getValue();
+        List<Block> blocksToDestroy = new ArrayList<>(blocks.size());
 
-        if (callExplosionEvent.getValue()) {
+        if (shouldCallExplosionEvent) {
             BlockExplodeEvent blockExplodeEvent = new BlockExplodeEvent(b, blocks, 0);
             Bukkit.getServer().getPluginManager().callEvent(blockExplodeEvent);
 
@@ -102,28 +106,39 @@ class UpgradedExplosiveTool extends ExplosiveTool {
         Bukkit.getServer().getPluginManager().callEvent(event);
 
         if (!event.isCancelled()) {
+            int bX = b.getX();
+            int bY = b.getY();
+            int bZ = b.getZ();
+            
+            if (canBreak(p, b)) {
+                breakBlock(p, item, b, drops, true);
+            }
+            
             for (Block block : blocksToDestroy) {
-                breakBlock(p, item, block, drops);
+                // Use coordinate comparison instead of location.equals() for better performance
+                if (block.getX() != bX || block.getY() != bY || block.getZ() != bZ) {
+                    breakBlock(p, item, block, drops, false);
+                }
             }
         }
     }
 
     private List<Block> findBlocks(Block b, BlockFace face) {
         List<Block> blocks = new ArrayList<>(26);
-        Block center = b;
+        boolean breakFromCenterValue = breakFromCenter.getValue();
+        
+        Block center = breakFromCenterValue ? b : b.getRelative(face, 2);
+        int bX = b.getX();
+        int bY = b.getY();
+        int bZ = b.getZ();
 
-        // Shift center block
-        if (!breakFromCenter.getValue()) {
-            center = b.getRelative(face, 2);
-        }
         for (int x = -2; x <= 2; x++) {
             for (int y = -2; y <= 2; y++) {
                 for (int z = -2; z <= 2; z++) {
-
                     Block relative = center.getRelative(x, y, z);
 
-                    // Skip the hit block
-                    if (relative.getLocation().equals(b.getLocation())) {
+                    // Use coordinate comparison instead of location.equals() for better performance
+                    if (relative.getX() == bX && relative.getY() == bY && relative.getZ() == bZ) {
                         continue;
                     }
 
@@ -145,36 +160,54 @@ class UpgradedExplosiveTool extends ExplosiveTool {
     protected boolean canBreak(@Nonnull Player p, @Nonnull Block b) {
         if (b.isEmpty() || b.isLiquid()) {
             return false;
-        } else if (SlimefunTag.UNBREAKABLE_MATERIALS.isTagged(b.getType())) {
-            return false;
-        } else if (!b.getWorld().getWorldBorder().isInside(b.getLocation())) {
-            return false;
-        } else if (Slimefun.getIntegrations().isCustomBlock(b)) {
-            return false;
-        } else {
-            return Slimefun.getProtectionManager().hasPermission(p, b.getLocation(), Interaction.BREAK_BLOCK);
         }
+        
+        Material type = b.getType();
+        if (SlimefunTag.UNBREAKABLE_MATERIALS.isTagged(type)) {
+            return false;
+        }
+        
+        org.bukkit.Location loc = b.getLocation();
+        if (!b.getWorld().getWorldBorder().isInside(loc)) {
+            return false;
+        }
+        
+        if (Slimefun.getIntegrations().isCustomBlock(b)) {
+            return false;
+        }
+        
+        return Slimefun.getProtectionManager().hasPermission(p, loc, Interaction.BREAK_BLOCK);
     }
 
-    private void breakBlock(Player p, ItemStack item, Block b, List<ItemStack> drops) {
+    private void breakBlock(Player p, ItemStack item, Block b, List<ItemStack> drops, boolean isOriginalBlock) {
         Slimefun.getProtectionManager().logAction(p, b, Interaction.BREAK_BLOCK);
-        Material material = b.getType();
-
-        b.getWorld().playEffect(b.getLocation(), Effect.STEP_SOUND, material);
+        
+        // Don't break SF blocks - check early to avoid unnecessary operations
         SlimefunItem sfItem = BlockStorage.check(b);
-
-        // Don't break SF blocks
         if (sfItem != null) {
             return;
         }
 
-        if (triggerOtherPlugins.getValue()) {
-            AlternateBreakEvent breakEvent = new AlternateBreakEvent(b, p);
-            Bukkit.getServer().getPluginManager().callEvent(breakEvent);
+        Material material = b.getType();
+        org.bukkit.Location loc = b.getLocation();
+        org.bukkit.World world = b.getWorld();
+        
+        world.playEffect(loc, Effect.STEP_SOUND, material);
+
+        if (isOriginalBlock) {
+            if (triggerOtherPlugins.getValue()) {
+                AlternateBreakEvent breakEvent = new AlternateBreakEvent(b, p);
+                Bukkit.getServer().getPluginManager().callEvent(breakEvent);
+            }
+            b.breakNaturally(item);
+            damageItem(p, item);
+        } else {
+            for (ItemStack drop : b.getDrops(item, p)) {
+                if (drop != null && !drop.getType().isAir()) {
+                    world.dropItemNaturally(loc, drop);
+                }
+            }
+            b.setType(Material.AIR, false);
         }
-
-        b.breakNaturally(item);
-
-        damageItem(p, item);
     }
 }
